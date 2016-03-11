@@ -2312,7 +2312,7 @@ static status_t add_policy_internal(private_kernel_netlink_ipsec_t *this,
 				iface = xfrm2host(policy->sel.family, &policy->sel.saddr, 0);
 				route->gateway = charon->kernel->get_nexthop(charon->kernel,
 												iface, policy->sel.prefixlen_s,
-												route->src_ip, NULL);
+												route->src_ip, &route->if_name);
 				iface->destroy(iface);
 			}
 			route->dst_net = chunk_alloc(policy->sel.family == AF_INET ? 4 : 16);
@@ -2321,18 +2321,21 @@ static status_t add_policy_internal(private_kernel_netlink_ipsec_t *this,
 			/* get the interface to install the route for. If we have a local
 			 * address, use it. Otherwise (for shunt policies) use the
 			 * routes source address. */
-			iface = ipsec->dst;
-			if (iface->is_anyaddr(iface))
+			if (!route->if_name)
 			{
-				iface = route->src_ip;
-			}
-			/* install route via outgoing interface */
-			if (!charon->kernel->get_interface(charon->kernel, iface,
-											   &route->if_name))
-			{
-				this->mutex->unlock(this->mutex);
-				route_entry_destroy(route);
-				return SUCCESS;
+				iface = ipsec->dst;
+				if (iface->is_anyaddr(iface))
+				{
+					iface = route->src_ip;
+				}
+				/* install route via outgoing interface */
+				if (!charon->kernel->get_interface(charon->kernel, iface,
+												   &route->if_name))
+				{
+					this->mutex->unlock(this->mutex);
+					route_entry_destroy(route);
+					return SUCCESS;
+				}
 			}
 
 			if (policy->route)
