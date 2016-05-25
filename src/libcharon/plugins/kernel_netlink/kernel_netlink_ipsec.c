@@ -39,6 +39,7 @@
 #include <daemon.h>
 #include <utils/debug.h>
 #include <threading/mutex.h>
+#include <threading/condvar.h>
 #include <collections/array.h>
 #include <collections/hashtable.h>
 #include <collections/linked_list.h>
@@ -286,6 +287,11 @@ struct private_kernel_netlink_ipsec_t {
 	 * Mutex to lock access to installed policies
 	 */
 	mutex_t *mutex;
+
+	/**
+	 * Condvar to synchronize access to individual policies
+	 */
+	condvar_t *condvar;
 
 	/**
 	 * Hash table of installed policies (policy_entry_t)
@@ -566,6 +572,12 @@ struct policy_entry_t {
 
 	/** reqid for this policy */
 	uint32_t reqid;
+
+	/** Number of threads waiting to work on this policy */
+	int waiting;
+
+	/** TRUE if a thread is working on this policy */
+	bool working;
 };
 
 /**
@@ -2151,6 +2163,20 @@ METHOD(kernel_ipsec_t, flush_sas, status_t,
 }
 
 /**
+ * Unlock the mutex and signal waiting threads
+ */
+static void policy_change_done(private_kernel_netlink_ipsec_t *this,
+							   policy_entry_t *policy)
+{
+	policy->working = FALSE;
+	if (policy->waiting)
+	{	/* don't need to wake threads waiting for other policies */
+		this->condvar->broadcast(this->condvar);
+	}
+	this->mutex->unlock(this->mutex);
+}
+
+/**
  * Add or update a policy in the kernel.
  *
  * Note: The mutex has to be locked when entering this function
@@ -2221,7 +2247,7 @@ static status_t add_policy_internal(private_kernel_netlink_ipsec_t *this,
 							   count * sizeof(*tmpl));
 		if (!tmpl)
 		{
-			this->mutex->unlock(this->mutex);
+			policy_change_done(this, policy);
 			return FAILED;
 		}
 
@@ -2254,7 +2280,7 @@ static status_t add_policy_internal(private_kernel_netlink_ipsec_t *this,
 
 	if (!add_mark(hdr, sizeof(request), ipsec->mark))
 	{
-		this->mutex->unlock(this->mutex);
+		policy_change_done(this, policy);
 		return FAILED;
 	}
 	this->mutex->unlock(this->mutex);
@@ -2266,22 +2292,13 @@ static status_t add_policy_internal(private_kernel_netlink_ipsec_t *this,
 		hdr->nlmsg_type = XFRM_MSG_UPDPOLICY;
 		status = this->socket_xfrm->send_ack(this->socket_xfrm, hdr);
 	}
+
+	this->mutex->lock(this->mutex);
 	if (status != SUCCESS)
 	{
+		policy_change_done(this, policy);
 		return FAILED;
 	}
-
-	/* find the policy again */
-	this->mutex->lock(this->mutex);
-	policy = this->policies->get(this->policies, &clone);
-	if (!policy ||
-		 policy->used_by->find_first(policy->used_by,
-									 NULL, (void**)&mapping) != SUCCESS)
-	{	/* policy or mapping is already gone, ignore */
-		this->mutex->unlock(this->mutex);
-		return SUCCESS;
-	}
-
 	/* install a route, if:
 	 * - this is a inbound policy (to just get one for each child)
 	 * - we are in tunnel/BEET mode or install a bypass policy
@@ -2330,7 +2347,7 @@ static status_t add_policy_internal(private_kernel_netlink_ipsec_t *this,
 			if (!charon->kernel->get_interface(charon->kernel, iface,
 											   &route->if_name))
 			{
-				this->mutex->unlock(this->mutex);
+				policy_change_done(this, policy);
 				route_entry_destroy(route);
 				return SUCCESS;
 			}
@@ -2340,7 +2357,7 @@ static status_t add_policy_internal(private_kernel_netlink_ipsec_t *this,
 				route_entry_t *old = policy->route;
 				if (route_entry_equals(old, route))
 				{
-					this->mutex->unlock(this->mutex);
+					policy_change_done(this, policy);
 					route_entry_destroy(route);
 					return SUCCESS;
 				}
@@ -2383,7 +2400,7 @@ static status_t add_policy_internal(private_kernel_netlink_ipsec_t *this,
 			free(route);
 		}
 	}
-	this->mutex->unlock(this->mutex);
+	policy_change_done(this, policy);
 	return SUCCESS;
 }
 
@@ -2427,6 +2444,14 @@ METHOD(kernel_ipsec_t, add_policy, status_t,
 		policy_entry_destroy(this, policy);
 		policy = current;
 		found = TRUE;
+
+		policy->waiting++;
+		while (policy->working)
+		{
+			this->condvar->wait(this->condvar, this->mutex);
+		}
+		policy->waiting--;
+		policy->working = TRUE;
 	}
 	else
 	{	/* use the new one, if we have no such policy */
@@ -2471,7 +2496,7 @@ METHOD(kernel_ipsec_t, add_policy, status_t,
 	if (!update)
 	{	/* we don't update the policy if the priority is lower than that of
 		 * the currently installed one */
-		this->mutex->unlock(this->mutex);
+		policy_change_done(this, policy);
 		return SUCCESS;
 	}
 
@@ -2593,6 +2618,7 @@ METHOD(kernel_ipsec_t, del_policy, status_t,
 		.mark = id->mark,
 		.cfg = *data->sa,
 	};
+	status_t status = SUCCESS;
 
 	DBG2(DBG_KNL, "deleting policy %R === %R %N  (mark %u/0x%08x)",
 		 id->src_ts, id->dst_ts, policy_dir_names, id->dir, id->mark.value,
@@ -2623,6 +2649,13 @@ METHOD(kernel_ipsec_t, del_policy, status_t,
 		this->mutex->unlock(this->mutex);
 		return NOT_FOUND;
 	}
+	current->waiting++;
+	while (current->working)
+	{
+		this->condvar->wait(this->condvar, this->mutex);
+	}
+	current->working = TRUE;
+	current->waiting--;
 
 	/* remove mapping to SA by reqid and priority */
 	auto_priority = get_priority(current, data->prio,id->interface);
@@ -2649,7 +2682,7 @@ METHOD(kernel_ipsec_t, del_policy, status_t,
 		DBG2(DBG_KNL, "policy still used by another CHILD_SA, not removed");
 		if (!is_installed)
 		{	/* no need to update as the policy was not installed for this SA */
-			this->mutex->unlock(this->mutex);
+			policy_change_done(this, current);
 			return SUCCESS;
 		}
 
@@ -2680,7 +2713,7 @@ METHOD(kernel_ipsec_t, del_policy, status_t,
 
 	if (!add_mark(hdr, sizeof(request), id->mark))
 	{
-		this->mutex->unlock(this->mutex);
+		policy_change_done(this, current);
 		return FAILED;
 	}
 
@@ -2696,9 +2729,6 @@ METHOD(kernel_ipsec_t, del_policy, status_t,
 				 id->dir);
 		}
 	}
-
-	this->policies->remove(this->policies, current);
-	policy_entry_destroy(this, current);
 	this->mutex->unlock(this->mutex);
 
 	if (this->socket_xfrm->send_ack(this->socket_xfrm, hdr) != SUCCESS)
@@ -2714,9 +2744,21 @@ METHOD(kernel_ipsec_t, del_policy, status_t,
 			DBG1(DBG_KNL, "unable to delete policy %R === %R %N",
 				 id->src_ts, id->dst_ts, policy_dir_names, id->dir);
 		}
-		return FAILED;
+		status = FAILED;
 	}
-	return SUCCESS;
+
+	this->mutex->lock(this->mutex);
+	if (!current->waiting)
+	{	/* only if no other thread still needs the policy */
+		this->policies->remove(this->policies, current);
+		policy_entry_destroy(this, current);
+		this->mutex->unlock(this->mutex);
+	}
+	else
+	{
+		policy_change_done(this, current);
+	}
+	return status;
 }
 
 METHOD(kernel_ipsec_t, flush_policies, status_t,
@@ -2972,6 +3014,7 @@ METHOD(kernel_ipsec_t, destroy, void,
 	enumerator->destroy(enumerator);
 	this->policies->destroy(this->policies);
 	this->sas->destroy(this->sas);
+	this->condvar->destroy(this->condvar);
 	this->mutex->destroy(this->mutex);
 	free(this);
 }
@@ -3011,6 +3054,7 @@ kernel_netlink_ipsec_t *kernel_netlink_ipsec_create()
 								(hashtable_equals_t)ipsec_sa_equals, 32),
 		.bypass = array_create(sizeof(bypass_t), 0),
 		.mutex = mutex_create(MUTEX_TYPE_DEFAULT),
+		.condvar = condvar_create(CONDVAR_TYPE_DEFAULT),
 		.policy_update = lib->settings->get_bool(lib->settings,
 					"%s.plugins.kernel-netlink.policy_update", FALSE, lib->ns),
 		.install_routes = lib->settings->get_bool(lib->settings,
