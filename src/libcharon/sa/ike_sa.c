@@ -71,6 +71,7 @@ ENUM(ike_sa_state_names, IKE_CREATED, IKE_DESTROYING,
 	"ESTABLISHED",
 	"PASSIVE",
 	"REKEYING",
+	"REKEYED",
 	"DELETING",
 	"DESTROYING",
 );
@@ -2348,7 +2349,8 @@ METHOD(ike_sa_t, retransmit, status_t,
 				reestablish(this);
 				break;
 		}
-		if (this->state != IKE_CONNECTING)
+		if (this->state != IKE_CONNECTING &&
+			this->state != IKE_REKEYED)
 		{
 			charon->bus->ike_updown(charon->bus, &this->public, FALSE);
 		}
@@ -2500,6 +2502,7 @@ METHOD(ike_sa_t, roam, status_t,
 		case IKE_DELETING:
 		case IKE_DESTROYING:
 		case IKE_PASSIVE:
+		case IKE_REKEYED:
 			return SUCCESS;
 		default:
 			break;
