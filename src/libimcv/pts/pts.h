@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2011 Sansar Choinyambuu
- * Copyright (C) 2012-2014 Andreas Steffen
+ * Copyright (C) 2012-2016 Andreas Steffen
  * HSR Hochschule fuer Technik Rapperswil
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -236,26 +236,27 @@ struct pts_t {
 	pts_file_meta_t* (*get_metadata)(pts_t *this, char *pathname, bool is_dir);
 
 	/**
-	 * Reads given PCR value and returns it
-	 * Expects owner secret to be WELL_KNOWN_SECRET
+	 * Retrieve the current value of a PCR register in a given PCR bank
 	 *
-	 * @param pcr_num			Number of PCR to read
-	 * @param pcr_value			Chunk to save pcr read output
-	 * @return					NULL in case of TSS error, PCR value otherwise
+	 * @param pcr_num		PCR number
+	 * @param pcr_value		PCR value returned
+	 * @param alg			hash algorithm, selects PCR bank (TPM 2.0 only)
+	 * @return				TRUE if PCR value retrieval succeeded
 	 */
-	bool (*read_pcr)(pts_t *this, uint32_t pcr_num, chunk_t *pcr_value);
+	bool (*read_pcr)(pts_t *this, uint32_t pcr_num, chunk_t *pcr_value,
+					 hash_algorithm_t alg);
 
 	/**
-	 * Extends given PCR with given value
-	 * Expects owner secret to be WELL_KNOWN_SECRET
+	 * Extend a PCR register in a given PCR bank with a hash value
 	 *
-	 * @param pcr_num			Number of PCR to extend
-	 * @param input				Value to extend
-	 * @param output			Chunk to save PCR value after extension
-	 * @return					FALSE in case of TSS error, TRUE otherwise
+	 * @param pcr_num		PCR number
+	 * @param pcr_value		extended PCR value returned
+	 * @param hash			data to be extended into the PCR
+	 * @param alg			hash algorithm, selects PCR bank (TPM 2.0 only)
+	 * @return				TRUE if PCR extension succeeded
 	 */
-	bool (*extend_pcr)(pts_t *this, uint32_t pcr_num, chunk_t input,
-					   chunk_t *output);
+	bool (*extend_pcr)(pts_t *this, uint32_t pcr_num, chunk_t *pcr_value,
+					   chunk_t data, hash_algorithm_t alg);
 
 	/**
 	 * Quote over PCR's

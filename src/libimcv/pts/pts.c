@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2011-2012 Sansar Choinyambuu
- * Copyright (C) 2012-2014 Andreas Steffen
+ * Copyright (C) 2012-2016 Andreas Steffen
  * HSR Hochschule fuer Technik Rapperswil
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,6 +20,8 @@
 #include <crypto/hashers/hasher.h>
 #include <bio/bio_writer.h>
 #include <bio/bio_reader.h>
+
+#include <tpm_tss.h>
 
 #ifdef TSS_TROUSERS
 #ifdef _BASETSD_H_
@@ -102,9 +104,9 @@ struct private_pts_t {
 	bool is_imc;
 
 	/**
-	 * Do we have an activated TPM
+	 * Active TPM
 	 */
-	bool has_tpm;
+	tpm_tss_t *tpm;
 
 	/**
 	 * Contains a TPM_CAP_VERSION_INFO struct
@@ -356,13 +358,9 @@ METHOD(pts_t, set_platform_id, void,
 METHOD(pts_t, get_tpm_version_info, bool,
 	private_pts_t *this, chunk_t *info)
 {
-	if (!this->has_tpm)
-	{
-		return FALSE;
-	}
-	*info = this->tpm_version_info;
-	print_tpm_version_info(this);
-	return TRUE;
+	*info = this->tpm ? this->tpm->get_version_info(this->tpm) :
+						this->tpm_version_info;
+	return info->len > 0;
 }
 
 METHOD(pts_t, set_tpm_version_info, void,
@@ -611,113 +609,29 @@ METHOD(pts_t, get_metadata, pts_file_meta_t*,
 	return metadata;
 }
 
-
-#ifdef TSS_TROUSERS
-
 METHOD(pts_t, read_pcr, bool,
-	private_pts_t *this, uint32_t pcr_num, chunk_t *pcr_value)
+	private_pts_t *this, uint32_t pcr_num, chunk_t *pcr_value,
+	hash_algorithm_t alg)
 {
-	TSS_HCONTEXT hContext;
-	TSS_HTPM hTPM;
-	TSS_RESULT result;
-	BYTE *buf;
-	UINT32 len;
-
-	bool success = FALSE;
-
-	result = Tspi_Context_Create(&hContext);
-	if (result != TSS_SUCCESS)
-	{
-		DBG1(DBG_PTS, "TPM context could not be created: tss error 0x%x", result);
-		return FALSE;
-	}
-
-	result = Tspi_Context_Connect(hContext, NULL);
-	if (result != TSS_SUCCESS)
-	{
-		goto err;
-	}
-	result = Tspi_Context_GetTpmObject (hContext, &hTPM);
-	if (result != TSS_SUCCESS)
-	{
-		goto err;
-	}
-	result = Tspi_TPM_PcrRead(hTPM, pcr_num, &len, &buf);
-	if (result != TSS_SUCCESS)
-	{
-		goto err;
-	}
-	*pcr_value = chunk_clone(chunk_create(buf, len));
-	DBG3(DBG_PTS, "PCR %d value:%B", pcr_num, pcr_value);
-	success = TRUE;
-
-err:
-	if (!success)
-	{
-		DBG1(DBG_PTS, "TPM not available: tss error 0x%x", result);
-	}
-	Tspi_Context_FreeMemory(hContext, NULL);
-	Tspi_Context_Close(hContext);
-
-	return success;
+	return this->tpm ? this->tpm->read_pcr(this->tpm, pcr_num, pcr_value, alg)
+				     : FALSE;
 }
 
 METHOD(pts_t, extend_pcr, bool,
-	private_pts_t *this, uint32_t pcr_num, chunk_t input, chunk_t *output)
+	private_pts_t *this, uint32_t pcr_num, chunk_t *pcr_value, chunk_t data,
+	hash_algorithm_t alg)
 {
-	TSS_HCONTEXT hContext;
-	TSS_HTPM hTPM;
-	TSS_RESULT result;
-	uint32_t pcr_length;
-	chunk_t pcr_value = chunk_empty;
-
-	result = Tspi_Context_Create(&hContext);
-	if (result != TSS_SUCCESS)
+	if (!this->tpm->extend_pcr(this->tpm, pcr_num, pcr_value, data, alg))
 	{
-		DBG1(DBG_PTS, "TPM context could not be created: tss error 0x%x",
-			 result);
 		return FALSE;
 	}
-	result = Tspi_Context_Connect(hContext, NULL);
-	if (result != TSS_SUCCESS)
-	{
-		goto err;
-	}
-	result = Tspi_Context_GetTpmObject (hContext, &hTPM);
-	if (result != TSS_SUCCESS)
-	{
-		goto err;
-	}
-
-	pcr_value = chunk_alloc(PTS_PCR_LEN);
-	result = Tspi_TPM_PcrExtend(hTPM, pcr_num, PTS_PCR_LEN, input.ptr,
-								NULL, &pcr_length, &pcr_value.ptr);
-	if (result != TSS_SUCCESS)
-	{
-		goto err;
-	}
-
-	*output = pcr_value;
-	*output = chunk_clone(*output);
-
-	DBG3(DBG_PTS, "PCR %d extended with:      %B", pcr_num, &input);
-	DBG3(DBG_PTS, "PCR %d value after extend: %B", pcr_num, output);
-
-	chunk_clear(&pcr_value);
-	Tspi_Context_FreeMemory(hContext, NULL);
-	Tspi_Context_Close(hContext);
+	DBG3(DBG_PTS, "PCR %d extended with:   %#B", pcr_num, &data);
+	DBG3(DBG_PTS, "PCR %d after extension: %#B", pcr_num, pcr_value);
 
 	return TRUE;
-
-err:
-	DBG1(DBG_PTS, "TPM not available: tss error 0x%x", result);
-
-	chunk_clear(&pcr_value);
-	Tspi_Context_FreeMemory(hContext, NULL);
-	Tspi_Context_Close(hContext);
-
-	return FALSE;
 }
+
+#ifdef TSS_TROUSERS
 
 METHOD(pts_t, quote_tpm, bool,
 	private_pts_t *this, bool use_quote2, chunk_t *pcr_comp, chunk_t *quote_sig)
@@ -732,7 +646,7 @@ METHOD(pts_t, quote_tpm, bool,
 	TSS_HPCRS hPcrComposite;
 	TSS_VALIDATION valData;
 	TSS_RESULT result;
-	chunk_t quote_info;
+	chunk_t pcr_value, quote_info;
 	BYTE* versionInfo;
 	uint32_t versionInfoSize, pcr;
 	enumerator_t *enumerator;
@@ -795,9 +709,15 @@ METHOD(pts_t, quote_tpm, bool,
 	}
 
 	/* Select PCRs */
+	DBG2(DBG_PTS, "PCR values hashed into PCR Composite:");
 	enumerator = this->pcrs->create_enumerator(this->pcrs);
 	while (enumerator->enumerate(enumerator, &pcr))
 	{
+		if (this->tpm->read_pcr(this->tpm, pcr, &pcr_value, HASH_SHA1))
+		{
+			DBG2(DBG_PTS, "PCR %2d %#B", pcr, &pcr_value);
+			chunk_free(&pcr_value);
+		};
 		result = use_quote2 ?
 				Tspi_PcrComposite_SelectPcrIndexEx(hPcrComposite, pcr,
 											TSS_PCRS_DIRECTION_RELEASE) :
@@ -874,18 +794,6 @@ err1:
 }
 
 #else /* TSS_TROUSERS */
-
-METHOD(pts_t, read_pcr, bool,
-	private_pts_t *this, uint32_t pcr_num, chunk_t *pcr_value)
-{
-	return FALSE;
-}
-
-METHOD(pts_t, extend_pcr, bool,
-	private_pts_t *this, uint32_t pcr_num, chunk_t input, chunk_t *output)
-{
-	return FALSE;
-}
 
 METHOD(pts_t, quote_tpm, bool,
 	private_pts_t *this, bool use_quote2, chunk_t *pcr_comp, chunk_t *quote_sig)
@@ -1064,6 +972,7 @@ METHOD(pts_t, get_pcrs, pts_pcr_t*,
 METHOD(pts_t, destroy, void,
 	private_pts_t *this)
 {
+	DESTROY_IF(this->tpm);
 	DESTROY_IF(this->pcrs);
 	DESTROY_IF(this->aik);
 	DESTROY_IF(this->dh);
@@ -1074,67 +983,6 @@ METHOD(pts_t, destroy, void,
 	free(this->tpm_version_info.ptr);
 	free(this);
 }
-
-
-#ifdef TSS_TROUSERS
-
-/**
- * Check for a TPM by querying for TPM Version Info
- */
-static bool has_tpm(private_pts_t *this)
-{
-	TSS_HCONTEXT hContext;
-	TSS_HTPM hTPM;
-	TSS_RESULT result;
-	uint32_t version_info_len;
-
-	result = Tspi_Context_Create(&hContext);
-	if (result != TSS_SUCCESS)
-	{
-		DBG1(DBG_PTS, "TPM context could not be created: tss error 0x%x",
-			 result);
-		return FALSE;
-	}
-	result = Tspi_Context_Connect(hContext, NULL);
-	if (result != TSS_SUCCESS)
-	{
-		goto err;
-	}
-	result = Tspi_Context_GetTpmObject (hContext, &hTPM);
-	if (result != TSS_SUCCESS)
-	{
-		goto err;
-	}
-	result = Tspi_TPM_GetCapability(hTPM, TSS_TPMCAP_VERSION_VAL,  0, NULL,
-									&version_info_len,
-									&this->tpm_version_info.ptr);
-	this->tpm_version_info.len = version_info_len;
-	if (result != TSS_SUCCESS)
-	{
-		goto err;
-	}
-	this->tpm_version_info = chunk_clone(this->tpm_version_info);
-
-	Tspi_Context_FreeMemory(hContext, NULL);
-	Tspi_Context_Close(hContext);
-	return TRUE;
-
-	err:
-	DBG1(DBG_PTS, "TPM not available: tss error 0x%x", result);
-	Tspi_Context_FreeMemory(hContext, NULL);
-	Tspi_Context_Close(hContext);
-	return FALSE;
-}
-
-#else /* TSS_TROUSERS */
-
-static bool has_tpm(private_pts_t *this)
-{
-	return FALSE;
-}
-
-#endif /* TSS_TROUSERS */
-
 
 /**
  * See header
@@ -1189,9 +1037,9 @@ pts_t *pts_create(bool is_imc)
 
 	if (is_imc)
 	{
-		if (has_tpm(this))
+		this->tpm = tpm_tss_probe(TPM_VERSION_ANY);
+		if (this->tpm)
 		{
-			this->has_tpm = TRUE;
 			this->proto_caps |= PTS_PROTO_CAPS_T | PTS_PROTO_CAPS_D;
 			load_aik(this);
 			load_aik_blob(this);

@@ -75,6 +75,29 @@ struct tpm_tss_t {
 	chunk_t (*get_public)(tpm_tss_t *this, uint32_t handle);
 
 	/**
+	 * Retrieve the current value of a PCR register in a given PCR bank
+	 *
+	 * @param pcr_num		PCR number
+	 * @param pcr_value		PCR value returned
+	 * @param alg			hash algorithm, selects PCR bank (TPM 2.0 only)
+	 * @return				TRUE if PCR value retrieval succeeded
+	 */
+	bool (*read_pcr)(tpm_tss_t *this, uint32_t pcr_num, chunk_t *pcr_value,
+					 hash_algorithm_t alg);
+
+	/**
+	 * Extend a PCR register in a given PCR bank with a hash value
+	 *
+	 * @param pcr_num		PCR number
+	 * @param pcr_value		extended PCR value returned
+	 * @param hash			data to be extended into the PCR
+	 * @param alg			hash algorithm, selects PCR bank (TPM 2.0 only)
+	 * @return				TRUE if PCR extension succeeded
+	 */
+	bool (*extend_pcr)(tpm_tss_t *this, uint32_t pcr_num, chunk_t *pcr_value,
+					   chunk_t data, hash_algorithm_t alg);
+
+	/**
 	 * Destroy a tpm_tss_t.
 	 */
 	void (*destroy)(tpm_tss_t *this);
