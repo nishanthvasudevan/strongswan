@@ -2315,7 +2315,7 @@ static bool install_route(private_kernel_pfkey_ipsec_t *this,
 	if (!dst->is_anyaddr(dst))
 	{
 		route->gateway = charon->kernel->get_nexthop(charon->kernel, dst, -1,
-													 src, NULL);
+													 src, &route->if_name);
 
 		/* if the IP is virtual, we install the route over the interface it has
 		 * been installed on. Otherwise we use the interface we use for IKE, as
